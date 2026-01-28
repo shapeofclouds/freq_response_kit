@@ -20,11 +20,14 @@ Clone the repository:
 ```powershell
 git clone https://github.com/shapeofclouds/freq_response_kit.git
 cd freq_response_kit
+```
 
 #### Create and populate the virtual environment:
 
+```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\deploy.ps1
+```
 
 This will:
 
@@ -34,10 +37,11 @@ This will:
 
 - install lab_instruments from a wheel
 
+```powershell
 .\.venv\Scripts\Activate.ps1
-python main.py
-
-Notes
+python main.py 
+```
+#### Notes
 
 This project intentionally runs against an installed release
 of lab_instruments, not a live repo checkout.
