@@ -15,7 +15,7 @@ a released wheel (not from a working copy).
 
 ## Setup
 
-Clone the repository:
+In Powershell clone the repository:
 
 ```powershell
 git clone https://github.com/shapeofclouds/freq_response_kit.git
