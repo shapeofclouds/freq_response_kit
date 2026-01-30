@@ -117,8 +117,8 @@ def main() -> int:
         try:
             dso.set_channel_coupling(1, "DC")
             dso.set_channel_coupling(2, "DC")
-            dso.set_channel_scale(1, 0.1)  # V/div (adjust if clipping)
-            dso.set_channel_scale(2, 0.1)
+            dso.set_channel_scale(1, 1.0)  # V/div (adjust if clipping)
+            dso.set_channel_scale(2, 1.0)
             dso.auto_timebase_for_freq(F_HZ)  # if you have a helper like this
         except Exception:
             print("Failed to configure scope frontend; proceeding anyway.")
