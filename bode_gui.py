@@ -1,6 +1,7 @@
-# sweep_bode.py
+#sweep_bode_args.py
 from __future__ import annotations
 
+import argparse
 import csv
 import math
 import time
@@ -15,11 +16,11 @@ from lab_instruments.devices.hantek_dso2d15 import HantekDSO2D15
 
 
 # =========================
-# USER SETTINGS
+# USER SETTINGS (DEFAULTS)
 # =========================
 START_HZ = 1.0
-STOP_HZ = 150_000.0
-POINTS_PER_DECADE = 20
+STOP_HZ = 100_000.0
+POINTS_PER_DECADE = 10
 
 AWG_CHANNEL = 1
 AWG_VPP = 0.25
@@ -29,7 +30,6 @@ AWG_LOAD_OHMS = 50  # if your driver supports it; otherwise ignored
 CH_DUT = 1
 CH_REF = 2
 
-
 COUPLING = "AC"         # "AC" or "DC"
 V_PER_DIV_REF = 0.2     # tweak these so both traces are nicely sized
 V_PER_DIV_DUT = 2.0
@@ -38,6 +38,93 @@ SETTLE_S = 0.25         # time to wait after changing frequency
 MEAS_AVG = 2            # acquisitions per point (simple averaging of gain/phase)
 
 OUT_CSV = Path(__file__).with_name("bode_sweep.csv")
+
+
+# =========================
+# CLI
+# =========================
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Log sweep Bode (gain/phase) using Owon DGE2070 + Hantek DSO2D15")
+
+    # Sweep
+    p.add_argument("--start-hz", type=float, default=START_HZ, help=f"Start frequency in Hz (default {START_HZ})")
+    p.add_argument("--stop-hz", type=float, default=STOP_HZ, help=f"Stop frequency in Hz (default {STOP_HZ})")
+    p.add_argument(
+        "--points-per-decade",
+        type=int,
+        default=POINTS_PER_DECADE,
+        help=f"Log points per decade (default {POINTS_PER_DECADE})",
+    )
+
+    # AWG
+    p.add_argument("--awg-channel", type=int, default=AWG_CHANNEL, help=f"AWG channel (default {AWG_CHANNEL})")
+    p.add_argument("--awg-vpp", type=float, default=AWG_VPP, help=f"AWG amplitude in Vpp (default {AWG_VPP})")
+    p.add_argument(
+        "--awg-load-ohms",
+        type=float,
+        default=AWG_LOAD_OHMS,
+        help=f"AWG output load in ohms (default {AWG_LOAD_OHMS})",
+    )
+
+    # DSO channels + frontend
+    p.add_argument("--ch-dut", type=int, default=CH_DUT, help=f"Scope channel for DUT output (default {CH_DUT})")
+    p.add_argument("--ch-ref", type=int, default=CH_REF, help=f"Scope channel for reference input (default {CH_REF})")
+    p.add_argument(
+        "--coupling",
+        type=str,
+        default=COUPLING,
+        choices=["AC", "DC"],
+        help=f"Scope coupling AC/DC (default {COUPLING})",
+    )
+    p.add_argument(
+        "--vdiv-ref",
+        type=float,
+        default=V_PER_DIV_REF,
+        help=f"Volts/div for REF channel (default {V_PER_DIV_REF})",
+    )
+    p.add_argument(
+        "--vdiv-dut",
+        type=float,
+        default=V_PER_DIV_DUT,
+        help=f"Volts/div for DUT channel (default {V_PER_DIV_DUT})",
+    )
+
+    # Acquisition
+    p.add_argument("--settle-s", type=float, default=SETTLE_S, help=f"Settle time in seconds (default {SETTLE_S})")
+    p.add_argument("--meas-avg", type=int, default=MEAS_AVG, help=f"Acquisitions averaged per point (default {MEAS_AVG})")
+
+    # Output
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=OUT_CSV,
+        help=f"CSV output path (default {OUT_CSV})",
+    )
+
+    return p
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.start_hz <= 0 or args.stop_hz <= 0:
+        raise SystemExit("Error: --start-hz and --stop-hz must be > 0")
+    if args.stop_hz <= args.start_hz:
+        raise SystemExit("Error: --stop-hz must be greater than --start-hz")
+    if args.points_per_decade <= 0:
+        raise SystemExit("Error: --points-per-decade must be >= 1")
+    if args.awg_channel <= 0:
+        raise SystemExit("Error: --awg-channel must be >= 1")
+    if args.ch_dut <= 0 or args.ch_ref <= 0:
+        raise SystemExit("Error: --ch-dut and --ch-ref must be >= 1")
+    if args.ch_dut == args.ch_ref:
+        raise SystemExit("Error: --ch-dut and --ch-ref must be different channels")
+    if args.awg_vpp <= 0:
+        raise SystemExit("Error: --awg-vpp must be > 0")
+    if args.vdiv_ref <= 0 or args.vdiv_dut <= 0:
+        raise SystemExit("Error: --vdiv-ref and --vdiv-dut must be > 0")
+    if args.settle_s < 0:
+        raise SystemExit("Error: --settle-s must be >= 0")
+    if args.meas_avg <= 0:
+        raise SystemExit("Error: --meas-avg must be >= 1")
 
 
 # =========================
@@ -146,43 +233,55 @@ def logspace_points(f_start: float, f_stop: float, pts_per_dec: int) -> np.ndarr
     return np.logspace(math.log10(f_start), math.log10(f_stop), n)
 
 
-def configure_dso_frontend(dso: HantekDSO2D15, f_hz: float) -> None:
+def configure_dso_frontend(
+    dso: HantekDSO2D15,
+    f_hz: float,
+    *,
+    ch_ref: int,
+    ch_dut: int,
+    coupling: str,
+    v_per_div_ref: float,
+    v_per_div_dut: float,
+) -> None:
     tb = choose_timebase_for_freq(f_hz)
-    # Note: your Hantek seems to like :CHAN1 / :CHAN2 forms for setting.
     dso.scpi.write(f":TIMEBASE:SCALE {tb:.12g}")
 
-    dso.scpi.write(f":CHAN{CH_REF}:COUPling {COUPLING}")
-    dso.scpi.write(f":CHAN{CH_DUT}:COUPling {COUPLING}")
+    dso.scpi.write(f":CHAN{ch_ref}:COUPling {coupling}")
+    dso.scpi.write(f":CHAN{ch_dut}:COUPling {coupling}")
 
-    dso.scpi.write(f":CHAN{CH_REF}:SCALe {V_PER_DIV_REF}")
-    dso.scpi.write(f":CHAN{CH_DUT}:SCALe {V_PER_DIV_DUT}")
+    dso.scpi.write(f":CHAN{ch_ref}:SCALe {v_per_div_ref}")
+    dso.scpi.write(f":CHAN{ch_dut}:SCALe {v_per_div_dut}")
 
-    # small settle after frontend changes
     time.sleep(0.15)
 
 
-def read_two_channels(dso: HantekDSO2D15) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def read_two_channels(dso: HantekDSO2D15, *, ch_ref: int, ch_dut: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     wave = dso.read_waveform_all()
-    meta = wave["metadata"]
 
     ch_data = {}
     for ch in wave["channels"]:
         if ch["enabled"]:
             ch_data[ch["channel"]] = (ch["time"], ch["voltage"])
 
-    if CH_REF not in ch_data or CH_DUT not in ch_data:
-        raise RuntimeError(f"Need CH{CH_REF} and CH{CH_DUT} enabled on the scope.")
+    if ch_ref not in ch_data or ch_dut not in ch_data:
+        raise RuntimeError(f"Need CH{ch_ref} and CH{ch_dut} enabled on the scope.")
 
-    t_ref, v_ref = ch_data[CH_REF]
-    t_dut, v_dut = ch_data[CH_DUT]
+    t_ref, v_ref = ch_data[ch_ref]
+    t_dut, v_dut = ch_data[ch_dut]
 
-    # time vectors should match; use ref
     return np.asarray(t_ref), np.asarray(v_ref), np.asarray(v_dut)
 
 
 def main() -> int:
-    freqs = logspace_points(START_HZ, STOP_HZ, POINTS_PER_DECADE)
-    OUT_CSV.write_text("")  # truncate
+    parser = build_argparser()
+    args = parser.parse_args()
+    validate_args(args)
+
+    freqs = logspace_points(args.start_hz, args.stop_hz, args.points_per_decade)
+
+    out_csv: Path = args.out
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_csv.write_text("")  # truncate
 
     print("Connecting instruments...")
     awg = OwonDGE2070.connect()
@@ -190,39 +289,51 @@ def main() -> int:
 
     try:
         # CSV header
-        with OUT_CSV.open("w", newline="") as f:
+        with out_csv.open("w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["freq_hz", "gain_db", "phase_deg"])
 
-        print(f"Configuring AWG: {AWG_VPP:.3f} Vpp")
-        # Use whichever methods your driver has; keep it simple and explicit:
-        # If your driver names differ, swap these two lines to match.
-        awg.set_sine(channel=AWG_CHANNEL, freq_hz=freqs[0], amplitude_vpp=AWG_VPP, load_ohms=AWG_LOAD_OHMS)
-        awg.output(AWG_CHANNEL, True)
+        print(f"Configuring AWG: {args.awg_vpp:.3f} Vpp")
+        awg.set_sine(
+            channel=args.awg_channel,
+            freq_hz=float(freqs[0]),
+            amplitude_vpp=args.awg_vpp,
+            load_ohms=args.awg_load_ohms,
+        )
+        awg.output(args.awg_channel, True)
 
-        gains = []
-        phases = []
+        gains: list[float] = []
+        phases: list[float] = []
 
         for f_hz in freqs:
-            # Set AWG freq
-            awg.set_sine(channel=AWG_CHANNEL, freq_hz=float(f_hz), amplitude_vpp=AWG_VPP, load_ohms=AWG_LOAD_OHMS)
+            awg.set_sine(
+                channel=args.awg_channel,
+                freq_hz=float(f_hz),
+                amplitude_vpp=args.awg_vpp,
+                load_ohms=args.awg_load_ohms,
+            )
 
-            # Set DSO frontend for this frequency
-            configure_dso_frontend(dso, float(f_hz))
+            configure_dso_frontend(
+                dso,
+                float(f_hz),
+                ch_ref=args.ch_ref,
+                ch_dut=args.ch_dut,
+                coupling=args.coupling,
+                v_per_div_ref=args.vdiv_ref,
+                v_per_div_dut=args.vdiv_dut,
+            )
 
-            time.sleep(SETTLE_S)
+            time.sleep(args.settle_s)
 
-            # Simple averaging across MEAS_AVG acquisitions
             g_list = []
             p_list = []
-            for _ in range(MEAS_AVG):
-                t, v_ref, v_dut = read_two_channels(dso)
+            for _ in range(args.meas_avg):
+                t, v_ref, v_dut = read_two_channels(dso, ch_ref=args.ch_ref, ch_dut=args.ch_dut)
                 g_db, p_deg = gain_phase_from_waveforms(v_ref, v_dut, t, float(f_hz))
                 g_list.append(g_db)
                 p_list.append(p_deg)
 
             gain_db = float(np.mean(g_list))
-            # phase averaging: do it on the unit circle
             p_rad = np.deg2rad(p_list)
             phase_deg = float(np.degrees(math.atan2(float(np.mean(np.sin(p_rad))), float(np.mean(np.cos(p_rad))))))
 
@@ -231,7 +342,7 @@ def main() -> int:
 
             print(f"{f_hz:9.2f} Hz  gain={gain_db:+7.3f} dB   phase={phase_deg:+7.2f} deg")
 
-            with OUT_CSV.open("a", newline="") as f:
+            with out_csv.open("a", newline="") as f:
                 w = csv.writer(f)
                 w.writerow([float(f_hz), gain_db, phase_deg])
 
@@ -240,14 +351,14 @@ def main() -> int:
         gains = np.asarray(gains)
         phases = np.asarray(phases)
 
-        fig1 = plt.figure(figsize=(10, 5))
+        plt.figure(figsize=(10, 5))
         plt.semilogx(freqs, gains, marker="o")
         plt.grid(True, which="both", ls="--")
         plt.xlabel("Frequency (Hz)")
         plt.ylabel("Gain (dB)")
         plt.title("Bode magnitude")
 
-        fig2 = plt.figure(figsize=(10, 5))
+        plt.figure(figsize=(10, 5))
         plt.semilogx(freqs, phases, marker="o")
         plt.grid(True, which="both", ls="--")
         plt.xlabel("Frequency (Hz)")
@@ -255,13 +366,12 @@ def main() -> int:
         plt.title("Bode phase (DUT - REF)")
 
         plt.show()
-        print(f"\nSaved: {OUT_CSV}")
+        print(f"\nSaved: {out_csv}")
         return 0
 
     finally:
-        # Safety: turn off AWG output and close
         try:
-            awg.output(AWG_CHANNEL, False)
+            awg.output(args.awg_channel, False)
         except Exception:
             pass
         try:
