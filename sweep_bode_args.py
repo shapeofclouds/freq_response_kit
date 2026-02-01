@@ -14,6 +14,17 @@ import matplotlib.pyplot as plt
 from lab_instruments.devices.owon_dge2070 import OwonDGE2070
 from lab_instruments.devices.hantek_dso2d15 import HantekDSO2D15
 
+from matplotlib.ticker import FuncFormatter
+
+import warnings
+import logging
+
+# Suppress noisy pyvisa-py TCPIP warnings (adjust if needed)
+warnings.filterwarnings("ignore", module=r"pyvisa_py\.tcpip")
+warnings.filterwarnings("ignore", category=ResourceWarning, module=r"pyvisa_py\..*")
+
+logging.getLogger("pyvisa").setLevel(logging.ERROR)
+logging.getLogger("pyvisa_py").setLevel(logging.ERROR)
 
 # =========================
 # USER SETTINGS (DEFAULTS)
@@ -38,6 +49,16 @@ SETTLE_S = 0.25         # time to wait after changing frequency
 MEAS_AVG = 2            # acquisitions per point (simple averaging of gain/phase)
 
 OUT_CSV = Path(__file__).with_name("bode_sweep.csv")
+
+def find_local_venv_python(script_path: str) -> str:
+    try:
+        base = Path(script_path).resolve().parent
+        cand = base / ".venv" / "Scripts" / "python.exe"
+        if cand.exists():
+            return str(cand)
+    except Exception:
+        pass
+    return ""
 
 
 # =========================
@@ -100,6 +121,12 @@ def build_argparser() -> argparse.ArgumentParser:
         default=OUT_CSV,
         help=f"CSV output path (default {OUT_CSV})",
     )
+
+    p.add_argument(
+    "--markers",
+    action="store_true",
+    help="Show data-point markers on plots (default: off)",
+)
 
     return p
 
@@ -347,25 +374,100 @@ def main() -> int:
                 w.writerow([float(f_hz), gain_db, phase_deg])
 
         # ---- Plots ----
+        
+
+        # ---- Plots (single figure, two panels) ----
         freqs = np.asarray(freqs)
         gains = np.asarray(gains)
-        phases = np.asarray(phases)
+        phases = np.asarray(phases)  # wrapped-ish degrees from measurement
 
-        plt.figure(figsize=(10, 5))
-        plt.semilogx(freqs, gains, marker="o")
-        plt.grid(True, which="both", ls="--")
-        plt.xlabel("Frequency (Hz)")
-        plt.ylabel("Gain (dB)")
-        plt.title("Bode magnitude")
+        # Marker control
+        marker = "o" if args.markers else None
 
-        plt.figure(figsize=(10, 5))
-        plt.semilogx(freqs, phases, marker="o")
-        plt.grid(True, which="both", ls="--")
-        plt.xlabel("Frequency (Hz)")
-        plt.ylabel("Phase (deg)")
-        plt.title("Bode phase (DUT - REF)")
+        # Unwrap phase to avoid +/-180 jumps, then shift into a sensible band
+        phase_rad = np.deg2rad(phases)
+        phase_unwrapped_deg = np.degrees(np.unwrap(phase_rad))
 
+        # Optional: bring values near the usual [-180, +180] neighborhood, but keep continuity
+        # Choose an offset so the median lies in (-180, 180]
+        offset = 360.0 * round(np.median(phase_unwrapped_deg) / 360.0)
+        phase_plot_deg = phase_unwrapped_deg - offset
+
+        # Formatter: display values wrapped to (-180, 180] even if we plot unwrapped
+        def wrap180(y, _pos=None):
+            y = (y + 180.0) % 360.0 - 180.0
+            # Make +180 show as 180 not -180
+            if abs(y + 180.0) < 1e-9:
+                y = 180.0
+            return f"{int(y):d}" if abs(y - round(y)) < 1e-9 else f"{y:g}"
+
+        fig, (ax_mag, ax_ph) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+        # Magnitude
+        ax_mag.semilogx(freqs, gains, marker=marker)
+        ax_mag.grid(True, which="both", ls="--")
+        ax_mag.set_ylabel("Gain (dB)")
+        ax_mag.set_title("Bode plot")
+
+        # Phase (continuous line; labels wrapped)
+        ax_ph.semilogx(freqs, phase_plot_deg, marker=marker)
+        ax_ph.grid(True, which="both", ls="--")
+        ax_ph.set_xlabel("Frequency (Hz)")
+        ax_ph.set_ylabel("Phase (deg)")
+        ax_ph.yaxis.set_major_formatter(FuncFormatter(wrap180))
+
+        # If you want the exact tick style around 180 when data is near that region:
+        # (creates ticks like 160,170,180,-170,-160 via formatter)
+       
+        # ---- Auto-scale phase axis tightly around data ----
+        # Work in the unwrapped plotting coordinates
+        y = phase_plot_deg
+
+        # Robust bounds (ignore extreme outliers)
+        p_lo, p_hi = np.percentile(y, [5, 95])
+
+        # Minimum visible span (degrees) so flat responses don't look silly
+        min_span = 20.0
+
+        span = max(min_span, p_hi - p_lo)
+
+        # Pad a little so the trace doesn't touch the frame
+        pad_frac = 0.15
+        pad = pad_frac * span
+
+        ymin = p_lo - pad
+        ymax = p_hi + pad
+
+        # ---- Choose a "nice" tick step based on span ----
+        def nice_step(span):
+            if span <= 20:
+                return 2
+            elif span <= 40:
+                return 5
+            elif span <= 80:
+                return 10
+            elif span <= 160:
+                return 20
+            else:
+                return 30
+
+        tick_step = nice_step(ymax - ymin)
+
+        # Snap limits to tick grid
+        start = tick_step * math.floor(ymin / tick_step)
+        stop  = tick_step * math.ceil(ymax / tick_step)
+
+        ticks = np.arange(start, stop + 0.5 * tick_step, tick_step)
+
+        ax_ph.set_ylim(start, stop)
+        ax_ph.set_yticks(ticks)
+
+
+
+        plt.tight_layout()
         plt.show()
+
+        
         print(f"\nSaved: {out_csv}")
         return 0
 

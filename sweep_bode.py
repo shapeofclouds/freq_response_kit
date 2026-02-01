@@ -18,8 +18,8 @@ from lab_instruments.devices.hantek_dso2d15 import HantekDSO2D15
 # USER SETTINGS
 # =========================
 START_HZ = 1.0
-STOP_HZ = 150_000.0
-POINTS_PER_DECADE = 20
+STOP_HZ = 100_000.0
+POINTS_PER_DECADE = 10
 
 AWG_CHANNEL = 1
 AWG_VPP = 0.25
