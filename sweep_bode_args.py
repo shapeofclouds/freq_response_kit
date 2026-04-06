@@ -224,6 +224,128 @@ def _interp_crossing_freq(
         return 10.0 ** lf
     else:
         return f1 + t * (f2 - f1)
+    
+def interp_y_at_x(
+    x1: float, y1: float, x2: float, y2: float, x_target: float, *, log_x: bool = True
+) -> float:
+    """
+    Interpolate y at x_target between (x1,y1) and (x2,y2).
+    If log_x=True, interpolate linearly in log10(x).
+    """
+    if x1 <= 0 or x2 <= 0:
+        log_x = False
+
+    if log_x:
+        lx1 = math.log10(x1)
+        lx2 = math.log10(x2)
+        lxt = math.log10(x_target)
+        if lx2 == lx1:
+            return float(y1)
+        t = (lxt - lx1) / (lx2 - lx1)
+    else:
+        if x2 == x1:
+            return float(y1)
+        t = (x_target - x1) / (x2 - x1)
+
+    t = max(0.0, min(1.0, float(t)))
+    return float(y1 + t * (y2 - y1))
+
+
+def find_high_side_gain_crossing(
+    freqs_hz: np.ndarray,
+    gains_db: np.ndarray,
+    target_db: float,
+) -> tuple[float | None, int | None]:
+    """
+    Find the first crossing of target_db on the high-frequency side.
+    Returns:
+        (f_cross, i)
+    where the crossing lies between i and i+1.
+    """
+    freqs = np.asarray(freqs_hz, dtype=float)
+    gains = np.asarray(gains_db, dtype=float)
+
+    if freqs.size < 2:
+        return None, None
+
+    i_max = int(np.nanargmax(gains))
+
+    for i in range(i_max, len(freqs) - 1):
+        g1 = float(gains[i])
+        g2 = float(gains[i + 1])
+        if (g1 - target_db) * (g2 - target_db) <= 0.0:
+            f_cross = _interp_crossing_freq(
+                float(freqs[i]), g1,
+                float(freqs[i + 1]), g2,
+                target_db,
+                log_f=True,
+            )
+            return float(f_cross), i
+
+    return None, None
+
+
+def phase_at_frequency(
+    freqs_hz: np.ndarray,
+    phases_deg: np.ndarray,
+    f_target: float,
+) -> float | None:
+    """
+    Interpolate phase at a target frequency.
+    Uses unwrapped phase internally so interpolation is sensible.
+    Returns wrapped result in (-180, 180].
+    """
+    freqs = np.asarray(freqs_hz, dtype=float)
+    phases = np.asarray(phases_deg, dtype=float)
+
+    if freqs.size < 2 or not np.isfinite(f_target):
+        return None
+
+    phase_unwrapped = np.degrees(np.unwrap(np.deg2rad(phases)))
+
+    for i in range(len(freqs) - 1):
+        f1 = float(freqs[i])
+        f2 = float(freqs[i + 1])
+        if f1 <= f_target <= f2:
+            p = interp_y_at_x(
+                f1, float(phase_unwrapped[i]),
+                f2, float(phase_unwrapped[i + 1]),
+                f_target,
+                log_x=True,
+            )
+            p = (p + 180.0) % 360.0 - 180.0
+            if abs(p + 180.0) < 1e-9:
+                p = 180.0
+            return float(p)
+
+    return None
+
+
+def estimate_rolloff_db_per_octave(
+    freqs_hz: np.ndarray,
+    gains_db: np.ndarray,
+    f_start: float,
+) -> float | None:
+    """
+    Estimate high-frequency roll-off (dB/octave) for points above f_start.
+    Fits gain_db = a*log2(f) + b, so slope a is in dB/octave.
+    Returns None if there are too few usable points.
+    """
+    freqs = np.asarray(freqs_hz, dtype=float)
+    gains = np.asarray(gains_db, dtype=float)
+
+    mask = np.isfinite(freqs) & np.isfinite(gains) & (freqs > f_start)
+    if np.count_nonzero(mask) < 2:
+        return None
+
+    x = np.log2(freqs[mask])
+    y = gains[mask]
+
+    if x.size < 2:
+        return None
+
+    a, b = np.polyfit(x, y, 1)
+    return float(a)
 
 
 def find_3db_bandwidth(
@@ -796,11 +918,32 @@ def main() -> int:
             ax_mag.axvline(f_hi_num, linestyle=":", linewidth=1)
 
         # Put a small info box on the magnitude plot
+        # ---- extra derived metrics for info box ----
+        f_0db, i_0db = find_high_side_gain_crossing(freqs, gains, 0.0)
+
+        if f_0db is None:
+            f_0db_str = "n/a"
+            phase_0db_str = "n/a"
+        else:
+            f_0db_str = f"{f_0db:g} Hz"
+            phase_0db = phase_at_frequency(freqs, phases, f_0db)
+            phase_0db_str = "n/a" if phase_0db is None else f"{phase_0db:+.1f} deg"
+
+        f_hi_num = _parse_freq_str(f_hi_str)
+        if f_hi_num is None:
+            rolloff_str = "n/a"
+        else:
+            rolloff = estimate_rolloff_db_per_octave(freqs, gains, f_hi_num)
+            rolloff_str = "n/a" if rolloff is None else f"{rolloff:.2f} dB/oct"
+
         info = (
             f"Max gain: {gmax_db:+.2f} dB\n"
             f"-3 dB level: {g3_db:+.2f} dB\n"
             f"fL (-3 dB): {f_lo_str}\n"
-            f"fH (-3 dB): {f_hi_str}"
+            f"fH (-3 dB): {f_hi_str}\n"
+            f"f @ 0 dB: {f_0db_str}\n"
+            f"Phase @ 0 dB: {phase_0db_str}\n"
+            f"Roll-off > fH: {rolloff_str}"
         )
         ax_mag.text(
             0.98, 0.98, info,
