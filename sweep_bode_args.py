@@ -393,6 +393,40 @@ def logspace_points(f_start: float, f_stop: float, pts_per_dec: int) -> np.ndarr
     n = int(decades * pts_per_dec) + 1
     return np.logspace(math.log10(f_start), math.log10(f_stop), n)
 
+def initialize_dso(
+    dso: HantekDSO2D15,
+    *,
+    ch_dut: int,
+    ch_ref: int,
+    coupling: str,
+    v_per_div_ref: float,
+    v_per_div_dut: float,
+) -> None:
+    """
+    One-time DSO setup:
+    - centre both traces vertically (zero offset)
+    - set coupling and initial V/div
+    - trigger on CH1, edge, level 0 V
+    """
+    # Ensure both channels are using the requested coupling
+    dso.scpi.write(f":CHAN{ch_ref}:COUPling {coupling}")
+    dso.scpi.write(f":CHAN{ch_dut}:COUPling {coupling}")
+
+    # Initial scales
+    dso.scpi.write(f":CHAN{ch_ref}:SCALe {v_per_div_ref}")
+    dso.scpi.write(f":CHAN{ch_dut}:SCALe {v_per_div_dut}")
+
+    # Centre traces vertically: zero offset
+    dso.scpi.write(f":CHAN{ch_ref}:OFFSet 0")
+    dso.scpi.write(f":CHAN{ch_dut}:OFFSet 0")
+
+    # Trigger: CH1, edge, level 0 V
+    dso.scpi.write(":TRIGger:MODE EDGE")
+    dso.scpi.write(":TRIGger:EDGE:SOURce CHAN1")
+    dso.scpi.write(":TRIGger:EDGE:SLOPe RISing")
+    dso.scpi.write(":TRIGger:EDGE:LEVel 0")
+
+    time.sleep(0.2)
 
 def configure_dso_frontend(
     dso: HantekDSO2D15,
@@ -551,6 +585,15 @@ def main() -> int:
     print("Connecting instruments...")
     awg = OwonDGE2070.connect()
     dso = HantekDSO2D15.connect_by_pattern()
+
+    initialize_dso(
+        dso,
+        ch_ref=args.ch_ref,
+        ch_dut=args.ch_dut,
+        coupling=args.coupling,
+        v_per_div_ref=args.vdiv_ref,
+        v_per_div_dut=args.vdiv_dut,
+    )
 
     try:
         # CSV header
