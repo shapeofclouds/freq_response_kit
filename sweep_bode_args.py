@@ -396,31 +396,28 @@ def logspace_points(f_start: float, f_stop: float, pts_per_dec: int) -> np.ndarr
 def initialize_dso(
     dso: HantekDSO2D15,
     *,
-    ch_dut: int,
     ch_ref: int,
+    ch_dut: int,
     coupling: str,
     v_per_div_ref: float,
     v_per_div_dut: float,
 ) -> None:
     """
     One-time DSO setup:
-    - centre both traces vertically (zero offset)
-    - set coupling and initial V/div
-    - trigger on CH1, edge, level 0 V
+    - requested coupling
+    - initial V/div
+    - zero vertical offset on both traces
+    - trigger = edge, source CH1, level 0 V, rising
     """
-    # Ensure both channels are using the requested coupling
     dso.scpi.write(f":CHAN{ch_ref}:COUPling {coupling}")
     dso.scpi.write(f":CHAN{ch_dut}:COUPling {coupling}")
 
-    # Initial scales
     dso.scpi.write(f":CHAN{ch_ref}:SCALe {v_per_div_ref}")
     dso.scpi.write(f":CHAN{ch_dut}:SCALe {v_per_div_dut}")
 
-    # Centre traces vertically: zero offset
     dso.scpi.write(f":CHAN{ch_ref}:OFFSet 0")
     dso.scpi.write(f":CHAN{ch_dut}:OFFSet 0")
 
-    # Trigger: CH1, edge, level 0 V
     dso.scpi.write(":TRIGger:MODE EDGE")
     dso.scpi.write(":TRIGger:EDGE:SOURce CHAN1")
     dso.scpi.write(":TRIGger:EDGE:SLOPe RISing")
@@ -447,6 +444,16 @@ def configure_dso_frontend(
     dso.scpi.write(f":CHAN{ch_ref}:SCALe {v_per_div_ref}")
     dso.scpi.write(f":CHAN{ch_dut}:SCALe {v_per_div_dut}")
 
+    # keep both traces vertically centred
+    dso.scpi.write(f":CHAN{ch_ref}:OFFSet 0")
+    dso.scpi.write(f":CHAN{ch_dut}:OFFSet 0")
+
+    # keep trigger fixed
+    dso.scpi.write(":TRIGger:MODE EDGE")
+    dso.scpi.write(":TRIGger:EDGE:SOURce CHAN1")
+    dso.scpi.write(":TRIGger:EDGE:SLOPe RISing")
+    dso.scpi.write(":TRIGger:EDGE:LEVel 0")
+
     time.sleep(0.15)
 
 
@@ -470,10 +477,9 @@ def read_two_channels(dso: HantekDSO2D15, *, ch_ref: int, ch_dut: int) -> tuple[
 def _allowed_vdivs() -> list[float]:
     """
     Common 1-2-5 vertical scales in V/div.
-    Adjust if your Hantek model supports a different set.
     """
     vals = []
-    for n in range(-3, 3):   # 1 mV/div up to 500 V/div
+    for n in range(-3, 4):   # 1 mV/div through larger decades, filtered below
         base = 10.0 ** n
         for m in (1, 2, 5):
             vals.append(m * base)
@@ -487,21 +493,24 @@ def choose_vdiv_for_vpp(
     min_div_pp: float = 2.0,
     max_div_pp: float = 6.0,
     allowed_vdivs: list[float] | None = None,
+    current_vdiv: float | None = None,
 ) -> float:
     """
-    Choose V/div so the waveform is preferably about target_div_pp divisions p-p,
+    Choose V/div so waveform is preferably about target_div_pp divisions p-p,
     while accepting anything between min_div_pp and max_div_pp divisions p-p.
 
-    Since p-p span in divisions is:
-        div_pp = vpp / vdiv
-    the ideal choice is:
-        vdiv ~= vpp / target_div_pp
+    If current_vdiv is already in-range, keep it.
     """
     if vpp <= 0 or not np.isfinite(vpp):
         raise ValueError("vpp must be finite and > 0")
 
     if allowed_vdivs is None:
         allowed_vdivs = _allowed_vdivs()
+
+    if current_vdiv is not None and current_vdiv > 0:
+        current_div_pp = vpp / current_vdiv
+        if min_div_pp <= current_div_pp <= max_div_pp:
+            return float(current_vdiv)
 
     ideal_vdiv = vpp / target_div_pp
 
@@ -514,15 +523,10 @@ def choose_vdiv_for_vpp(
     if acceptable:
         return min(acceptable, key=lambda x: abs(x - ideal_vdiv))
 
-    # If nothing lands in the 2–6 div window, choose closest to target.
     return min(allowed_vdivs, key=lambda x: abs(x - ideal_vdiv))
 
 
 def estimate_vpp(x: np.ndarray) -> float:
-    """
-    Robust-ish Vpp estimate from captured waveform.
-    Percentiles help a little against spikes/noise.
-    """
     x = np.asarray(x, dtype=float)
     if x.size == 0:
         return float("nan")
@@ -530,46 +534,75 @@ def estimate_vpp(x: np.ndarray) -> float:
     hi = np.percentile(x, 99.0)
     return float(hi - lo)
 
-
 def autorange_dut_vertical(
     dso: HantekDSO2D15,
     *,
     ch_ref: int,
     ch_dut: int,
-    initial_vdiv_dut: float,
+    current_vdiv_dut: float,
     settle_s: float,
-) -> float:
+    keep_min_div_pp: float = 1.8,
+    keep_max_div_pp: float = 6.2,
+    choose_min_div_pp: float = 2.0,
+    choose_max_div_pp: float = 6.0,
+    target_div_pp: float = 4.0,
+    max_passes: int = 2,
+) -> tuple[float, float]:
     """
-    Perform one quick read using the current DUT V/div, estimate DUT Vpp,
-    then choose a better DUT V/div to place the trace roughly 2–6 div p-p
-    (prefer ~4 div p-p). Returns the chosen V/div.
+    Adjust DUT V/div with hysteresis.
 
-    If the first estimate is unusable, returns the original setting.
+    keep_* window:
+        If current scale already gives a waveform inside this wider window,
+        keep the scale unchanged to avoid chatter.
+
+    choose_* window:
+        When a change is needed, choose a new scale aiming for ~target_div_pp.
+
+    Returns:
+        (final_vdiv, final_div_pp_est)
     """
-    time.sleep(max(0.05, 0.5 * settle_s))
+    current_vdiv = float(current_vdiv_dut)
+    final_div_pp = float("nan")
 
-    try:
-        _, _, v_dut = read_two_channels(dso, ch_ref=ch_ref, ch_dut=ch_dut)
-    except Exception:
-        return initial_vdiv_dut
+    for _ in range(max_passes):
+        time.sleep(max(0.05, 0.5 * settle_s))
 
-    vpp_dut = estimate_vpp(v_dut)
-    if not np.isfinite(vpp_dut) or vpp_dut <= 0:
-        return initial_vdiv_dut
+        try:
+            _, _, v_dut = read_two_channels(dso, ch_ref=ch_ref, ch_dut=ch_dut)
+        except Exception:
+            return current_vdiv, final_div_pp
 
-    try:
-        new_vdiv = choose_vdiv_for_vpp(vpp_dut)
-    except Exception:
-        return initial_vdiv_dut
+        vpp_dut = estimate_vpp(v_dut)
+        if not np.isfinite(vpp_dut) or vpp_dut <= 0:
+            return current_vdiv, final_div_pp
 
-    # Avoid pointless writes
-    if abs(new_vdiv - initial_vdiv_dut) / max(initial_vdiv_dut, 1e-12) < 0.05:
-        return initial_vdiv_dut
+        div_pp = vpp_dut / current_vdiv
+        final_div_pp = div_pp
 
-    dso.scpi.write(f":CHAN{ch_dut}:SCALe {new_vdiv}")
-    time.sleep(max(0.05, 0.5 * settle_s))
-    return new_vdiv
+        # Hysteresis: keep current scale if already comfortably OK
+        if keep_min_div_pp <= div_pp <= keep_max_div_pp:
+            return current_vdiv, final_div_pp
 
+        try:
+            new_vdiv = choose_vdiv_for_vpp(
+                vpp_dut,
+                target_div_pp=target_div_pp,
+                min_div_pp=choose_min_div_pp,
+                max_div_pp=choose_max_div_pp,
+                current_vdiv=current_vdiv,
+            )
+        except Exception:
+            return current_vdiv, final_div_pp
+
+        # No meaningful change
+        if abs(new_vdiv - current_vdiv) / max(current_vdiv, 1e-12) < 0.05:
+            return current_vdiv, final_div_pp
+
+        dso.scpi.write(f":CHAN{ch_dut}:SCALe {new_vdiv}")
+        dso.scpi.write(f":CHAN{ch_dut}:OFFSet 0")
+        current_vdiv = new_vdiv
+
+    return current_vdiv, final_div_pp
 
 def main() -> int:
     parser = build_argparser()
@@ -616,6 +649,8 @@ def main() -> int:
         thd_refs = []
         thd_corrs = []
 
+        current_vdiv_dut = float(args.vdiv_dut)
+
         for f_hz in freqs:
             awg.set_sine(
                 channel=args.awg_channel,
@@ -631,16 +666,16 @@ def main() -> int:
                 ch_dut=args.ch_dut,
                 coupling=args.coupling,
                 v_per_div_ref=args.vdiv_ref,
-                v_per_div_dut=args.vdiv_dut,   # initial guess only
+                v_per_div_dut=current_vdiv_dut,
             )
 
             time.sleep(args.settle_s)
 
-            actual_vdiv_dut = autorange_dut_vertical(
+            current_vdiv_dut, dut_div_pp = autorange_dut_vertical(
                 dso,
                 ch_ref=args.ch_ref,
                 ch_dut=args.ch_dut,
-                initial_vdiv_dut=args.vdiv_dut,
+                current_vdiv_dut=current_vdiv_dut,
                 settle_s=args.settle_s,
             )
 
@@ -691,7 +726,7 @@ def main() -> int:
                 f"{f_hz:9.2f} Hz  "
                 f"gain={gain_db:+7.3f} dB   phase={phase_deg:+7.2f} deg   "
                 f"THD(dut)={thd_dut_pct:6.3f}%  THD(corr)={thd_corr_pct:6.3f}%  THD(ref)={thd_ref_pct:6.3f}%  "
-                f"DUT_scale={actual_vdiv_dut:g} V/div"
+                f"DUT_scale={current_vdiv_dut:g} V/div  DUT_pp={dut_div_pp:.2f} div"
             )
 
             with out_csv.open("a", newline="") as f:
